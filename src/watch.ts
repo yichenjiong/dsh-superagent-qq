@@ -106,7 +106,13 @@ export function buildTrigger(account: QqAccount, d: QqMessagePayload, media: Dow
   const attachments = Array.isArray(d.attachments) ? d.attachments : []
   if (!msgId || (!content && attachments.length === 0)) return undefined
   const groupOpenid = typeof d.group_openid === 'string' && d.group_openid ? d.group_openid : undefined
-  const userOpenid = typeof d.user_openid === 'string' && d.user_openid ? d.user_openid : undefined
+  // Real C2C events carry the user openid only in author.user_openid (the
+  // top-level user_openid is empty); group events still use top-level group_openid.
+  const userOpenid = typeof d.user_openid === 'string' && d.user_openid
+    ? d.user_openid
+    : !(typeof d.group_openid === 'string' && d.group_openid) && typeof d.author?.user_openid === 'string' && d.author.user_openid
+      ? d.author.user_openid
+      : undefined
   // 群聊发件人在 author.member_openid；单聊在 author.user_openid / user_openid（字段名 M1 真机核对）。
   const actorId = String(d.author?.member_openid ?? d.author?.user_openid ?? d.user_openid ?? '')
   if (!actorId) return undefined
