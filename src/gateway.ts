@@ -45,11 +45,16 @@ export async function getAppAccessToken(appId: string, appSecret: string): Promi
     body: JSON.stringify({ appId, clientSecret: appSecret }),
     signal: AbortSignal.timeout(15_000),
   })
-  const body = (await res.json().catch(() => ({}))) as { accessToken?: string; expiresIn?: string | number }
-  if (!res.ok || !body.accessToken) throw new Error('getAppAccessToken failed: HTTP ' + res.status + ' ' + JSON.stringify(body).slice(0, 200))
-  const expiresIn = Number(body.expiresIn ?? 7200)
-  tokenCaches.set(appId, { token: body.accessToken, expiresAt: now + (Number.isFinite(expiresIn) ? expiresIn : 7200) * 1000 })
-  return body.accessToken
+  // The QQ OpenAPI returns snake_case fields (access_token/expires_in) in practice;
+  // some environments return camelCase. Accept both.
+  const body = (await res.json().catch(() => ({}))) as {
+    accessToken?: string; access_token?: string; expiresIn?: string | number; expires_in?: string | number
+  }
+  const token = body.accessToken ?? body.access_token
+  if (!res.ok || !token) throw new Error('getAppAccessToken failed: HTTP ' + res.status + ' ' + JSON.stringify(body).slice(0, 200))
+  const expiresIn = Number(body.expiresIn ?? body.expires_in ?? 7200)
+  tokenCaches.set(appId, { token, expiresAt: now + (Number.isFinite(expiresIn) ? expiresIn : 7200) * 1000 })
+  return token
 }
 
 /** REST auth headers; x-union-appid follows the official bot-node-sdk precedent. */

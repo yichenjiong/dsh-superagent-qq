@@ -29,11 +29,12 @@ async function getAppAccessToken() {
     signal: AbortSignal.timeout(15_000),
   })
   const body = await res.json().catch(() => ({}))
-  if (!res.ok || !body.accessToken) {
+  const token = body.accessToken ?? body.access_token
+  if (!res.ok || !token) {
     throw new Error('getAppAccessToken failed: HTTP ' + res.status + ' ' + JSON.stringify(body).slice(0, 300))
   }
   console.log('>> token ok, expiresIn=' + body.expiresIn)
-  return body.accessToken
+  return token
 }
 
 const token = await getAppAccessToken()
