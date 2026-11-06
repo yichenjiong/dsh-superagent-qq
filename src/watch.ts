@@ -37,6 +37,12 @@ export function pause(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
+/** Sanitize an attachment's original filename before embedding it in the
+ *  trigger text: strip control characters and newlines, collapse whitespace,
+ *  and cap the length (prompt-injection hardening). */
+const safeFileName = (name: string): string =>
+  name.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
+
 const isoAt = (d: QqMessagePayload): string => {
   const ts = typeof d.timestamp === 'string' ? d.timestamp : undefined
   if (ts) {
@@ -141,7 +147,7 @@ export function buildTrigger(account: QqAccount, d: QqMessagePayload, media: Dow
       const label = m.kind === 'video' ? '视频' : m.kind === 'audio' ? '语音' : '文件'
       if (m.path) {
         const hint = m.kind === 'video' ? '如需理解内容，可用 ffmpeg 抽帧后用 read_image 查看' : '用 read/bash 工具查看内容'
-        return '[' + label + '已保存: ' + m.path + (m.name ? '（原名: ' + m.name + '）' : '') + ' —— ' + hint + ']'
+        return '[' + label + '已保存: ' + m.path + (m.name ? '（原名: ' + safeFileName(m.name) + '）' : '') + ' —— ' + hint + ']'
       }
       return '[QQ' + label + '下载失败' + (m.error ? ': ' + m.error : '') + ']'
     })
@@ -194,7 +200,7 @@ async function handleEvent(source: SourceContextLike, account: QqAccount, event:
     return
   }
   const d = (event.d ?? {}) as QqMessagePayload
-  if (!dumped.has(account.appId)) {
+  if (process.env['QQ_DEBUG_PAYLOAD'] === '1' && !dumped.has(account.appId)) {
     dumped.add(account.appId)
     // 每账号首条消息 dump 原始 payload（≤500 字符）：核对真实字段名（M1/M2，含 attachments）。
     console.error('[qq] first payload dump (' + account.appId + ' ' + t + '): ' + JSON.stringify(d).slice(0, 500))
