@@ -45,8 +45,7 @@ export async function getAppAccessToken(appId: string, appSecret: string): Promi
     body: JSON.stringify({ appId, clientSecret: appSecret }),
     signal: AbortSignal.timeout(15_000),
   })
-  // The QQ OpenAPI returns snake_case fields (access_token/expires_in) in practice;
-  // some environments return camelCase. Accept both.
+  // QQ 平台实际返回 snake_case（access_token/expires_in），部分环境返回 camelCase；两者都接受。
   const body = (await res.json().catch(() => ({}))) as {
     accessToken?: string; access_token?: string; expiresIn?: string | number; expires_in?: string | number
   }

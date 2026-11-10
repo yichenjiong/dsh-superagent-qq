@@ -36,10 +36,17 @@ export interface OutboundMessageLike {
   ticketId?: string
 }
 
+export interface BindTargetLike { appId: string; groupOpenid: string; groupName?: string; actorId: string }
+export type BindResultLike =
+  | { ok: true; repository: string; project: string; rebound: boolean }
+  | { ok: false; reason: 'invalid' | 'expired' | 'used' | 'already-bound' | 'live-ticket' | 'source-not-installed' | 'conflict' }
+
 export interface SourceContextLike {
   readonly deployment: { repository: string }
   configured(): boolean
   config<C>(kind: string): C | undefined
+  /** Redeems a one-time binding code; absent in older cores. */
+  redeemBind?(code: string, target: BindTargetLike): Promise<BindResultLike>
   receive(trigger: TriggerLike): unknown | Promise<unknown>
   threads: {
     describe(key: string, description: Record<string, unknown>): void

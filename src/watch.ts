@@ -8,9 +8,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { SourceContextLike, TriggerLike } from './types.ts'
 import { channelConfig, HEALTH_ENTRY } from './qq-kind.ts'
-import type { QqAccount, QqConfig } from './qq-kind.ts'
+import type { QqAccount, QqConfig, QqGroup } from './qq-kind.ts'
 import { GatewayClient, type GatewayEvent } from './gateway.ts'
-import { attachmentKey, downloadQqMediaToFile, isImageContentType, mediaKindOf, type MediaDownloadOpts } from './robot.ts'
+import { attachmentKey, downloadQqMediaToFile, isImageContentType, mediaKindOf, sendPassiveReply, type MediaDownloadOpts } from './robot.ts'
 
 export interface QqAttachment { content_type?: string; filename?: string; url?: string; [key: string]: unknown }
 
@@ -37,11 +37,39 @@ export function pause(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
-/** Sanitize an attachment's original filename before embedding it in the
- *  trigger text: strip control characters and newlines, collapse whitespace,
- *  and cap the length (prompt-injection hardening). */
+/** 清洗附件原名后再拼进 trigger 文本：去掉控制字符与换行、压缩空白、限制长度，
+ *  避免文件名里的换行/指令性文字被当成上下文（提示词注入面）。 */
 const safeFileName = (name: string): string =>
   name.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
+
+/** A binding code as the core prints it: BIND-XXXX-XXXX, case and separators insensitive. */
+const BIND_CODE = /\bBIND[\s_-]*([A-Za-z0-9]{4})[\s_-]*([A-Za-z0-9]{4})\b/i
+export const bindCodeOf = (text: string): string | undefined => {
+  const match = BIND_CODE.exec(text)
+  return match ? 'BIND-' + match[1]!.toUpperCase() + '-' + match[2]!.toUpperCase() : undefined
+}
+/** What a group message asks for: a prompt, a code to redeem, a bound group, or a rebound one. */
+export type GroupRoute =
+  | { kind: 'none' }
+  | { kind: 'prompt' }
+  | { kind: 'redeem'; code: string }
+  | { kind: 'rebind'; code: string }
+  | { kind: 'bound'; repository: string }
+export function groupRoute(config: QqConfig | undefined, appId: string, groupOpenid: string | undefined,
+  text: string): GroupRoute {
+  if (!groupOpenid) return { kind: 'none' }
+  const row: QqGroup | undefined = config?.groups.find(item => item.groupOpenid === groupOpenid && item.appId === appId)
+  const code = bindCodeOf(text)
+  const bound = row?.repository || ''
+  if (code) return bound ? { kind: 'rebind', code } : { kind: 'redeem', code }
+  if (bound) return { kind: 'bound', repository: bound }
+  return { kind: 'prompt' }
+}
+/** The connection identity: accounts, direct-message switch, and group membership. A repository change must not reconnect. */
+export function connectionHash(config: QqConfig): string {
+  return JSON.stringify([config.accounts, config.directMessages,
+    [...config.groups].map(group => [group.appId, group.groupOpenid]).sort((a, b) => String(a).localeCompare(String(b)))])
+}
 
 const isoAt = (d: QqMessagePayload): string => {
   const ts = typeof d.timestamp === 'string' ? d.timestamp : undefined
@@ -112,8 +140,7 @@ export function buildTrigger(account: QqAccount, d: QqMessagePayload, media: Dow
   const attachments = Array.isArray(d.attachments) ? d.attachments : []
   if (!msgId || (!content && attachments.length === 0)) return undefined
   const groupOpenid = typeof d.group_openid === 'string' && d.group_openid ? d.group_openid : undefined
-  // Real C2C events carry the user openid only in author.user_openid (the
-  // top-level user_openid is empty); group events still use top-level group_openid.
+  // 实测 C2C 事件只在 author.user_openid 里带用户 openid（顶层 user_openid 为空）；群事件仍看顶层 group_openid。
   const userOpenid = typeof d.user_openid === 'string' && d.user_openid
     ? d.user_openid
     : !(typeof d.group_openid === 'string' && d.group_openid) && typeof d.author?.user_openid === 'string' && d.author.user_openid
@@ -193,7 +220,25 @@ export function buildTrigger(account: QqAccount, d: QqMessagePayload, media: Dow
 
 const HANDLED_EVENTS = new Set(['GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'])
 
-async function handleEvent(source: SourceContextLike, account: QqAccount, event: GatewayEvent, dumped: Set<string>): Promise<void> {
+interface EventDeps {
+  send?: typeof sendPassiveReply
+  download?: typeof downloadMessageMedia
+}
+const bindReply = (result: Awaited<ReturnType<NonNullable<SourceContextLike['redeemBind']>>>, rebound: boolean): string => {
+  if (result.ok) return `${rebound ? '已改绑到' : '已绑定'} ${result.project}（${result.repository}）`
+  switch (result.reason) {
+    case 'expired': return '这个绑定码已过期，请私聊管理员重新获取。'
+    case 'used': return '这个绑定码已经用过了，请私聊管理员重新获取。'
+    case 'live-ticket': return '这个群还有进行中的工单，不能改绑；请新建群，或先结束工单。'
+    case 'already-bound': return '这个群已经绑定项目了。'
+    case 'source-not-installed': return '绑定服务不可用，请确认 QQ 插件与核心版本匹配。'
+    case 'conflict': return '保存绑定时出错，请重试。'
+    default: return '绑定码无效，请私聊管理员获取新的绑定码。'
+  }
+}
+
+export async function handleEvent(source: SourceContextLike, account: QqAccount, event: GatewayEvent, dumped: Set<string>,
+  deps: EventDeps = {}): Promise<void> {
   const t = String(event.t ?? '')
   if (!HANDLED_EVENTS.has(t)) {
     console.error('[qq] event ignored: t=' + (t || '(none)'))
@@ -205,15 +250,51 @@ async function handleEvent(source: SourceContextLike, account: QqAccount, event:
     // 每账号首条消息 dump 原始 payload（≤500 字符）：核对真实字段名（M1/M2，含 attachments）。
     console.error('[qq] first payload dump (' + account.appId + ' ' + t + '): ' + JSON.stringify(d).slice(0, 500))
   }
-  // 附件先落盘（带超时降级），receive 时路径已就位；图片只嵌标记，不在此下载。
-  const media = await downloadMessageMedia(d)
-  const trigger = buildTrigger(account, d, media)
-  if (!trigger) {
-    console.error('[qq] skip msg: t=' + t + ' id=' + String(d.id ?? '') + ' (missing fields after parse)')
+  const send = deps.send ?? sendPassiveReply
+  const download = deps.download ?? downloadMessageMedia
+  const msgId = String(d.id ?? '')
+  const groupOpenid = typeof d.group_openid === 'string' && d.group_openid ? d.group_openid : undefined
+  const config = source.config<QqConfig>('qq')
+  const text = String(d.content ?? '')
+  const group = groupRoute(config, account.appId, groupOpenid, text)
+  const reply = async (body: string): Promise<void> => {
+    if (!groupOpenid || !msgId) return
+    try {
+      await send(account.appId, account.appSecret, { scope: 'group', openid: groupOpenid, msgId }, body)
+    } catch (error) {
+      console.error('[qq] bind reply failed: group=' + groupOpenid + ' ' + String(error).slice(0, 200))
+    }
+  }
+  // Binding is decided before downloading anything: an unbound group or a code message must not fetch its attachments.
+  if (group.kind === 'prompt') {
+    console.error('[qq] unbound group: appId=' + account.appId + ' group=' + groupOpenid + ' msgId=' + msgId)
+    await reply('这个群还没绑定项目，请私聊管理员获取绑定码。')
     return
   }
-  console.error('[qq] msg in: t=' + t + ' msgId=' + String(d.id ?? '') + ' scope=' + String(trigger.meta.scopeKind)
-    + ' actor=' + trigger.actor.id + ' media=' + media.length + ' text="' + trigger.text.slice(0, 60) + '"')
+  if (group.kind === 'redeem' || group.kind === 'rebind') {
+    console.error('[qq] bind code: appId=' + account.appId + ' group=' + groupOpenid + ' msgId=' + msgId + ' rebind=' + (group.kind === 'rebind'))
+    const groupName = config?.groups.find(row => row.appId === account.appId && row.groupOpenid === groupOpenid)?.name
+    const result = source.redeemBind
+      ? await source.redeemBind(group.code, { appId: account.appId, groupOpenid: groupOpenid!, ...(groupName ? { groupName } : {}),
+        actorId: String(d.author?.member_openid ?? d.author?.user_openid ?? d.user_openid ?? '') })
+      : { ok: false as const, reason: 'source-not-installed' as const }
+    await reply(bindReply(result, group.kind === 'rebind'))
+    return
+  }
+  // 附件先落盘（带超时降级），receive 时路径已就位；图片只嵌标记，不在此下载。
+  const media = await download(d)
+  const trigger = buildTrigger(account, d, media)
+  if (!trigger) {
+    console.error('[qq] skip msg: t=' + t + ' id=' + msgId + ' (missing fields after parse)')
+    return
+  }
+  if (group.kind === 'bound') {
+    trigger.channel!.address.repository = group.repository
+    trigger.meta.repository = group.repository
+  }
+  console.error('[qq] msg in: t=' + t + ' msgId=' + msgId + ' scope=' + String(trigger.meta.scopeKind)
+    + ' actor=' + trigger.actor.id + ' media=' + media.length + ' repository=' + String(trigger.meta.repository ?? '-')
+    + ' text="' + trigger.text.slice(0, 60) + '"')
   await source.receive(trigger)
 }
 
@@ -230,7 +311,7 @@ function disconnectAll(state: WatchState): void {
 }
 
 export async function ensureClients(source: SourceContextLike, state: WatchState, config: QqConfig): Promise<void> {
-  const hash = JSON.stringify([config.accounts, config.groups, config.directMessages])
+  const hash = connectionHash(config)
   if (state.hash !== hash) {
     // 配置变化：全部断开重建（含被移除的账号）。
     disconnectAll(state)
